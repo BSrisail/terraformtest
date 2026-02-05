@@ -1,0 +1,122 @@
+name: Terraform Pipeline with Manual Approval
+
+on:
+  push:
+    branches: [ main ]
+
+env:
+  TF_VERSION: '1.5.0'
+  AWS_REGION: 'us-east-1'
+
+jobs:
+  terraform-plan:
+    name: "Terraform Plan"
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v3
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Terraform Init
+      run: terraform init
+    
+    - name: Terraform Format Check
+      run: terraform fmt -check
+    
+    - name: Terraform Validate
+      run: terraform validate
+    
+    - name: Terraform Plan
+      id: plan
+      run: terraform plan -var-file="dev.tfvars" -out=tfplan
+    
+    - name: Save Plan Output
+      run: terraform show tfplan > plan.txt
+    
+    - name: Upload Plan Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: tf-plan-${{ github.sha }}
+        path: |
+          tfplan
+          plan.txt
+
+  manual-approval:
+    name: "⏸️ Wait for Manual Approval"
+    needs: terraform-plan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Pause for approval
+      run: |
+        echo "=========================================="
+        echo "🚨 MANUAL APPROVAL REQUIRED"
+        echo "=========================================="
+        echo ""
+        echo "Please review the Terraform plan at:"
+        echo "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        echo ""
+        echo "To approve and continue, click on this job"
+        echo "and then click the 'Approve' button below."
+        echo ""
+        echo "OR create a new comment with '/deploy' on"
+        echo "the PR that triggered this workflow."
+        echo "=========================================="
+    
+    # This creates a manual approval step in GitHub UI
+    - name: Manual Approval
+      uses: pivotal/halt-action@v1
+      with:
+        allowed_actors: ${{ github.actor }},srisail  # Add your GitHub username
+
+  terraform-apply:
+    name: "🚀 Terraform Apply"
+    needs: manual-approval
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+    
+    - name: Download Plan Artifact
+      uses: actions/download-artifact@v3
+      with:
+        name: tf-plan-${{ github.sha }}
+    
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v2
+      with:
+        terraform_version: ${{ env.TF_VERSION }}
+    
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v3
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+    
+    - name: Terraform Init
+      run: terraform init
+    
+    - name: Terraform Apply
+      run: terraform apply -auto-approve tfplan
+    
+    - name: Apply Success
+      run: |
+        echo "✅ Terraform apply completed successfully!"
+        echo ""
+        echo "Resources deployed:"
+        echo "-------------------"
+        terraform state list || echo "Could not list state"
