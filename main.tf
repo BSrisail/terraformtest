@@ -1,9 +1,9 @@
 provider "aws" {
-  region = "us-east-1" 
+  region = "us-east-1"
 }
 
 resource "aws_instance" "ec2_instance" {
-  for_each = var.components
+  for_each               = var.components
   ami                    = var.ami
   instance_type          = each.value.instance_type
   vpc_security_group_ids = var.vpc_security_group_ids
