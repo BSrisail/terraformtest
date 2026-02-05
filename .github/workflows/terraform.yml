@@ -3,10 +3,16 @@ name: Terraform Pipeline with Manual Approval
 on:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 env:
   TF_VERSION: '1.5.0'
   AWS_REGION: 'us-east-1'
+
+permissions:
+  contents: read
+  id-token: write
 
 jobs:
   terraform-plan:
@@ -15,15 +21,15 @@ jobs:
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4  # Updated to v4
     
     - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
+      uses: hashicorp/setup-terraform@v3  # Updated to v3
       with:
         terraform_version: ${{ env.TF_VERSION }}
     
     - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
+      uses: aws-actions/configure-aws-credentials@v4  # Updated to v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -46,62 +52,106 @@ jobs:
       run: terraform show tfplan > plan.txt
     
     - name: Upload Plan Artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4  # CHANGED FROM v3 to v4
       with:
         name: tf-plan-${{ github.sha }}
         path: |
           tfplan
           plan.txt
+        retention-days: 1
+    
+    - name: Create Plan Summary
+      run: |
+        echo "## 📋 Terraform Plan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Branch:** \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "**Commit:** \`${{ github.sha_short }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Plan Output:" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        terraform show tfplan | head -50 >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "---" >> $GITHUB_STEP_SUMMARY
+        echo "*If this plan looks good, approve the deployment below*" >> $GITHUB_STEP_SUMMARY
 
+  # Manual Approval Step - Using workflow_dispatch as a gate
   manual-approval:
-    name: "⏸️ Wait for Manual Approval"
+    name: "⏸️ Manual Approval Required"
     needs: terraform-plan
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
     
     steps:
-    - name: Pause for approval
+    - name: Display Approval Instructions
       run: |
         echo "=========================================="
         echo "🚨 MANUAL APPROVAL REQUIRED"
         echo "=========================================="
         echo ""
-        echo "Please review the Terraform plan at:"
-        echo "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+        echo "To approve this deployment:"
         echo ""
-        echo "To approve and continue, click on this job"
-        echo "and then click the 'Approve' button below."
+        echo "1. Go to: https://github.com/${{ github.repository }}/actions"
+        echo "2. Find workflow run #${{ github.run_number }}"
+        echo "3. Click on 'manual-approval' job"
+        echo "4. Click 'Approve' button"
         echo ""
-        echo "OR create a new comment with '/deploy' on"
-        echo "the PR that triggered this workflow."
+        echo "OR"
+        echo ""
+        echo "Run this workflow manually with:"
+        echo "https://github.com/${{ github.repository }}/actions/workflows/terraform.yml"
         echo "=========================================="
     
-    # This creates a manual approval step in GitHub UI
-    - name: Manual Approval
-      uses: pivotal/halt-action@v1
+    # This creates a manual gate that requires UI interaction
+    - name: Wait for manual approval
+      uses: trstringer/manual-approval@v1
       with:
-        allowed_actors: ${{ github.actor }},srisail  # Add your GitHub username
+        secret: ${{ github.token }}
+        approvers: ${{ github.actor }},BSrisail  # Add your GitHub username
+        minimum-approvals: 1
+        issue-title: "Approve Terraform Deployment - ${{ github.sha_short }}"
+        issue-body: |
+          ## ✅ Approval Required for Terraform Deployment
+          
+          **Repository:** ${{ github.repository }}
+          **Branch:** ${{ github.ref_name }}
+          **Commit:** ${{ github.sha }}
+          **Triggered by:** @${{ github.actor }}
+          
+          ### 📋 Plan Details:
+          View the full Terraform plan output in the [GitHub Actions Run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+          
+          ### ✅ How to Approve:
+          Comment **"approved"** on this issue to proceed with deployment.
+          
+          ### ❌ How to Reject:
+          Comment **"rejected"** to cancel the deployment.
+          
+          ---
+          *Note: You need to be in the approvers list to approve.*
 
   terraform-apply:
     name: "🚀 Terraform Apply"
     needs: manual-approval
+    if: always()
     runs-on: ubuntu-latest
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
     
     - name: Download Plan Artifact
-      uses: actions/download-artifact@v3
+      uses: actions/download-artifact@v4  # CHANGED FROM v3 to v4
       with:
         name: tf-plan-${{ github.sha }}
     
     - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v2
+      uses: hashicorp/setup-terraform@v3
       with:
         terraform_version: ${{ env.TF_VERSION }}
     
     - name: Configure AWS Credentials
-      uses: aws-actions/configure-aws-credentials@v3
+      uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -110,13 +160,31 @@ jobs:
     - name: Terraform Init
       run: terraform init
     
+    - name: Verify Plan File Exists
+      run: |
+        if [ ! -f "tfplan" ]; then
+          echo "❌ Error: tfplan file not found!"
+          exit 1
+        fi
+        echo "✅ Plan file found, proceeding with apply..."
+    
     - name: Terraform Apply
       run: terraform apply -auto-approve tfplan
     
-    - name: Apply Success
+    - name: Apply Success Notification
       run: |
-        echo "✅ Terraform apply completed successfully!"
-        echo ""
-        echo "Resources deployed:"
-        echo "-------------------"
-        terraform state list || echo "Could not list state"
+        echo "## ✅ Terraform Apply Successful!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "Infrastructure has been deployed successfully to AWS." >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Deployment Details:**" >> $GITHUB_STEP_SUMMARY
+        echo "- **AWS Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+        echo "- **State Backend:** S3://amzn-s3-tf-srisail/ec2-components/terraform.tfstate" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📊 Managed Resources:" >> $GITHUB_STEP_SUMMARY
+        if command -v terraform &> /dev/null; then
+          terraform state list 2>/dev/null | while read -r resource; do
+            echo "- \`$resource\`" >> $GITHUB_STEP_SUMMARY
+          done || echo "*Could not list resources*" >> $GITHUB_STEP_SUMMARY
+        fi
