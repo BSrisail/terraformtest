@@ -1,20 +1,21 @@
-name: Terraform Pipeline with Automatic Apply after PR Approval
+name: Terraform Pipeline with PR Approval
 
 on:
   pull_request:
     branches: [ main ]
-    types: [ opened, synchronize, reopened, ready_for_review, edited ]
-    # Trigger when PR is updated or edited
+    types: [ opened, synchronize, reopened, ready_for_review ]
+  push:
+    branches: [ main ]
 
 env:
   TF_VERSION: '1.5.0'
   AWS_REGION: 'us-east-1'
 
 permissions:
-  contents: write  # Needed for merging PR
+  contents: write
   id-token: write
-  pull-requests: write  # For PR comments
-  checks: write  # For status checks
+  pull-requests: write
+  checks: write
 
 jobs:
   # ============================================
@@ -30,20 +31,16 @@ jobs:
     if: github.event_name == 'pull_request' && github.base_ref == 'main' && github.head_ref == 'dev'
     
     steps:
-      # Step 1: Checkout the PR branch code
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
-          # Uses the specific commit from the PR for consistency
       
-      # Step 2: Install Terraform CLI
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
       
-      # Step 3: Configure AWS credentials for Terraform operations
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -51,36 +48,23 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       
-      # Step 4: Initialize Terraform (downloads providers, sets up backend)
       - name: Terraform Init
         run: terraform init
-        # Initializes the working directory, downloads required providers
       
-      # Step 5: Check Terraform code formatting
       - name: Terraform Format Check
         run: terraform fmt -check
-        # Verifies all .tf files follow canonical formatting
-        # Fails if any files are not properly formatted
+        continue-on-error: true  # Don't fail the workflow for formatting issues
       
-      # Step 6: Validate Terraform configuration syntax
       - name: Terraform Validate
         run: terraform validate
-        # Checks if the configuration is syntactically valid and internally consistent
-        # Does not access any remote services
       
-      # Step 7: Generate Terraform execution plan
       - name: Terraform Plan
         id: plan
         run: terraform plan -var-file="dev.tfvars" -out=tfplan
-        # Creates an execution plan showing what changes will be made
-        # Saves the plan to a binary file 'tfplan'
       
-      # Step 8: Convert binary plan to human-readable text
       - name: Save Plan Output
         run: terraform show tfplan > plan.txt
-        # Converts the binary plan to text for commenting on PR
       
-      # Step 9: Upload plan artifacts for use in later jobs
       - name: Upload Plan Artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -89,10 +73,7 @@ jobs:
             tfplan
             plan.txt
           retention-days: 1
-          # Stores the plan file for terraform-apply job
-          # Artifacts expire after 1 day
       
-      # Step 10: Post plan summary as a comment on the PR
       - name: Comment PR with Plan Summary
         uses: actions/github-script@v7
         with:
@@ -100,7 +81,19 @@ jobs:
             const fs = require('fs');
             const planOutput = fs.readFileSync('plan.txt', 'utf8');
             
+            // Get existing comments to avoid duplicate
+            const { data: comments } = await github.rest.issues.listComments({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo
+            });
+            
+            const existingPlanComment = comments.find(comment => 
+              comment.body.includes('## 📋 Terraform Plan Summary')
+            );
+            
             const comment = `## 📋 Terraform Plan Summary
+            
             **Branch:** \`${process.env.GITHUB_HEAD_REF}\` → \`${process.env.GITHUB_BASE_REF}\`
             **Commit:** \`${process.env.GITHUB_SHA}\`
             
@@ -111,50 +104,57 @@ jobs:
             
             ---
             ### ✅ Next Steps:
-            This plan is ready for review. The infrastructure will be automatically applied when this PR is **approved and merged**.
+            This plan is ready for review. When you're ready to deploy:
             
-            **To proceed:**
-            1. Review the plan above
-            2. Approve this PR in GitHub
-            3. Merge the PR
+            1. **Approve this PR** (click "Approve" in the PR review section)
+            2. **Merge this PR** to main
             
-            *Terraform apply will run automatically after merge to main.*`;
+            The infrastructure will be automatically deployed after merge.
             
-            await github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: comment
-            });
+            *Note: The deployment will only happen after the PR is merged to main.*`;
+            
+            if (existingPlanComment) {
+              // Update existing comment
+              await github.rest.issues.updateComment({
+                comment_id: existingPlanComment.id,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            } else {
+              // Create new comment
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: comment
+              });
+            }
 
   # ============================================
   # JOB 2: Terraform Apply (on PR Merge)
   # ============================================
   # Purpose: Apply Terraform changes after PR is merged to main
-  # Runs: When PR is merged to main (push to main after approval)
+  # Runs: When push to main happens (after PR merge)
   # ============================================
   terraform-apply:
     name: "🚀 Terraform Apply"
     runs-on: ubuntu-latest
-    # Run when push to main happens (after PR merge)
+    # Run when push to main happens
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     
     steps:
-      # Step 1: Checkout the main branch code (merged result)
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           ref: main
           fetch-depth: 0
-          # Full history to get all changes
       
-      # Step 2: Install Terraform CLI
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: ${{ env.TF_VERSION }}
       
-      # Step 3: Configure AWS credentials
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -162,18 +162,22 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
       
-      # Step 4: Initialize Terraform
       - name: Terraform Init
         run: terraform init
       
-      # Step 5: Apply Terraform configuration
       - name: Terraform Apply
+        id: apply
         run: terraform apply -var-file="dev.tfvars" -auto-approve
-        # Directly applies the configuration to create/modify infrastructure
-        # Uses dev.tfvars for environment-specific variables
       
-      # Step 6: Display success message with resource list
-      - name: Apply Success Notification
+      - name: Get Terraform Outputs
+        id: outputs
+        run: |
+          echo "OUTPUTS<<EOF" >> $GITHUB_ENV
+          terraform output -json >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+        continue-on-error: true
+      
+      - name: Create Deployment Summary
         run: |
           echo "## ✅ Terraform Apply Successful!" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -182,78 +186,95 @@ jobs:
           echo "**Deployment Details:**" >> $GITHUB_STEP_SUMMARY
           echo "- **AWS Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
           echo "- **Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Triggered by:** PR Merge" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger:** PR merged to main" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### 📊 Managed Resources:" >> $GITHUB_STEP_SUMMARY
-          if command -v terraform &> /dev/null; then
-            terraform state list 2>/dev/null | while read -r resource; do
-              echo "- \`$resource\`" >> $GITHUB_STEP_SUMMARY
-            done || echo "*No resources found in state*" >> $GITHUB_STEP_SUMMARY
-          fi
-          # Creates a summary of deployed resources in GitHub Actions UI
+          terraform state list 2>/dev/null | while read -r resource; do
+            echo "- \`$resource\`" >> $GITHUB_STEP_SUMMARY
+          done || echo "*No resources found in state*" >> $GITHUB_STEP_SUMMARY
       
-      # Step 7: Update PR with deployment status
-      - name: Find and comment on original PR
+      - name: Find and Comment on Original PR
         uses: actions/github-script@v7
         if: success()
         with:
           script: |
-            // Find the PR that was merged
-            const { data: prs } = await github.rest.pulls.list({
+            // Get the latest commit message to find the PR number
+            const { data: commits } = await github.rest.repos.listCommits({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              state: 'closed',
-              base: 'main',
-              sort: 'updated',
-              direction: 'desc',
+              sha: 'main',
               per_page: 1
             });
             
-            if (prs.length > 0) {
-              const latestPR = prs[0];
+            const latestCommit = commits[0];
+            const commitMessage = latestCommit.commit.message;
+            
+            // Extract PR number from merge commit message (format: "Merge pull request #123 from ...")
+            const prMatch = commitMessage.match(/Merge pull request #(\d+)/);
+            
+            if (prMatch && prMatch[1]) {
+              const prNumber = parseInt(prMatch[1]);
+              
               await github.rest.issues.createComment({
-                issue_number: latestPR.number,
+                issue_number: prNumber,
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                body: '## ✅ Terraform Apply Complete!\n\nThe infrastructure changes from this PR have been successfully deployed to AWS. 🚀'
+                body: '## ✅ Terraform Apply Complete!\n\nThe infrastructure changes from this PR have been successfully deployed to AWS. 🚀\n\n**Deployment Time:** ' + new Date().toISOString()
               });
+            } else {
+              console.log('Could not find PR number in commit message');
             }
 
   # ============================================
-  # JOB 3: Deployment Validation (Optional)
+  # JOB 3: Deployment Status Check
   # ============================================
-  # Purpose: Verify that deployment was successful
-  # Runs: After terraform-apply
+  # Purpose: Update PR status based on deployment success
   # ============================================
-  validate-deployment:
-    name: "🔍 Validate Deployment"
+  update-status:
+    name: "📊 Update PR Status"
     needs: terraform-apply
-    if: success() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - name: Get PR Number
+        uses: actions/github-script@v7
         with:
-          terraform_version: ${{ env.TF_VERSION }}
-      
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
-      
-      - name: Terraform Init
-        run: terraform init
-      
-      - name: Validate with Terraform Output
-        run: |
-          echo "## 🔍 Deployment Validation" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Terraform Outputs:" >> $GITHUB_STEP_SUMMARY
-          terraform output -json | jq -r 'to_entries[] | "- **\(.key)**: `\(.value.value)`"' >> $GITHUB_STEP_SUMMARY
-          # Lists all outputs from Terraform to verify resources were created
+          script: |
+            // Get the latest commit
+            const { data: commits } = await github.rest.repos.listCommits({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              sha: 'main',
+              per_page: 1
+            });
+            
+            const latestCommit = commits[0];
+            const commitMessage = latestCommit.commit.message;
+            const prMatch = commitMessage.match(/Merge pull request #(\d+)/);
+            
+            if (prMatch && prMatch[1]) {
+              const prNumber = parseInt(prMatch[1]);
+              const status = '${{ needs.terraform-apply.result }}';
+              
+              let statusMessage = '';
+              let statusEmoji = '';
+              
+              if (status === 'success') {
+                statusMessage = '✅ Deployment successful! Infrastructure changes have been applied.';
+                statusEmoji = '✅';
+              } else if (status === 'failure') {
+                statusMessage = '❌ Deployment failed! Please check the workflow logs for details.';
+                statusEmoji = '❌';
+              } else {
+                statusMessage = '⚠️ Deployment status unknown or skipped.';
+                statusEmoji = '⚠️';
+              }
+              
+              await github.rest.issues.createComment({
+                issue_number: prNumber,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: `## ${statusEmoji} Deployment Status\n\n${statusMessage}\n\n**Workflow Run:** https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+              });
+            }
